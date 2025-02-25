@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	ledgerbackend "github.com/withObsrvr/stellar-ledgerbackend"
 
 	// Import the core plugin API definitions. Adjust the import path as needed.
+
 	"github.com/withObsrvr/pluginapi"
 )
 
@@ -48,6 +50,20 @@ func (adapter *BufferedStorageSourceAdapter) Version() string {
 // Type indicates this is a Source plugin.
 func (adapter *BufferedStorageSourceAdapter) Type() pluginapi.PluginType {
 	return pluginapi.SourcePlugin
+}
+
+// verifyPipeline checks if the pipeline is properly configured
+func (adapter *BufferedStorageSourceAdapter) verifyPipeline() error {
+	if len(adapter.processors) == 0 {
+		return errors.New("no processors registered in pipeline")
+	}
+
+	log.Printf("Pipeline verification: Found %d processors", len(adapter.processors))
+	for i, proc := range adapter.processors {
+		log.Printf("Pipeline processor %d: %T", i, proc)
+	}
+
+	return nil
 }
 
 // Initialize reads the configuration map and sets up the adapter.
@@ -143,6 +159,14 @@ func (adapter *BufferedStorageSourceAdapter) Initialize(config map[string]interf
 
 	log.Printf("BufferedStorageSourceAdapter initialized with start_ledger=%d, end_ledger=%d, bucket=%s, network=%s",
 		startLedger, endLedger, bucketName, network)
+
+	// Add pipeline verification after initialization
+	if err := adapter.verifyPipeline(); err != nil {
+		log.Printf("Warning: Pipeline verification failed: %v", err)
+		// Optionally return the error if you want to fail initialization
+		// return err
+	}
+
 	return nil
 }
 
@@ -153,18 +177,22 @@ func (adapter *BufferedStorageSourceAdapter) Subscribe(proc pluginapi.Processor)
 
 // Start begins the processing loop.
 func (adapter *BufferedStorageSourceAdapter) Start(ctx context.Context) error {
-	log.Printf("Starting BufferedStorageSourceAdapter from ledger %d", adapter.config.StartLedger)
-	if adapter.config.EndLedger > 0 {
-		log.Printf("Will process until ledger %d", adapter.config.EndLedger)
-	} else {
-		log.Printf("Will process indefinitely from start ledger")
+
+	log.Printf("Starting BufferedStorageSourceAdapter with config: %+v", adapter.config)
+
+	if err := adapter.verifyPipeline(); err != nil {
+		return fmt.Errorf("pipeline verification failed: %w", err)
 	}
 
-	// Create DataStore configuration.
+	// Create schema configuration
 	schema := datastore.DataStoreSchema{
 		LedgersPerFile:    adapter.config.LedgersPerFile,
 		FilesPerPartition: adapter.config.FilesPerPartition,
 	}
+
+	log.Printf("Created schema configuration: %+v", schema)
+
+	// Create data store configuration
 	dataStoreConfig := datastore.DataStoreConfig{
 		Type:   "GCS",
 		Schema: schema,
@@ -172,6 +200,19 @@ func (adapter *BufferedStorageSourceAdapter) Start(ctx context.Context) error {
 			"destination_bucket_path": adapter.config.BucketName,
 		},
 	}
+
+	log.Printf("Attempting to connect to GCS bucket: %s", adapter.config.BucketName)
+
+	log.Printf("Starting BufferedStorageSourceAdapter from ledger %d", adapter.config.StartLedger)
+	if adapter.config.EndLedger > 0 {
+		log.Printf("Will process until ledger %d", adapter.config.EndLedger)
+	} else {
+		log.Printf("Will process indefinitely from start ledger")
+	}
+
+	// Add debug logging for configuration
+	log.Printf("Using configuration: %+v", adapter.config)
+	log.Printf("Number of registered processors: %d", len(adapter.processors))
 
 	// Create buffered storage configuration.
 	bufferedConfig := cdp.DefaultBufferedStorageBackendConfig(schema.LedgersPerFile)
@@ -184,6 +225,10 @@ func (adapter *BufferedStorageSourceAdapter) Start(ctx context.Context) error {
 		DataStoreConfig:       dataStoreConfig,
 		BufferedStorageConfig: bufferedConfig,
 	}
+
+	log.Printf("Created DataStore configuration: %+v", dataStoreConfig)
+	log.Printf("Created buffered configuration: %+v", bufferedConfig)
+	log.Printf("Created publisher configuration: %+v", publisherConfig)
 
 	// Determine ledger range.
 	var ledgerRange ledgerbackend.Range
@@ -202,11 +247,27 @@ func (adapter *BufferedStorageSourceAdapter) Start(ctx context.Context) error {
 	lastLogTime := time.Now()
 	lastLedgerTime := time.Now()
 
+	// Add a ticker for periodic status updates even if no ledgers are being processed
+	statusTicker := time.NewTicker(10 * time.Second)
+	defer statusTicker.Stop()
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-statusTicker.C:
+				log.Printf("Still alive - Processed %d ledgers so far", processedLedgers)
+			}
+		}
+	}()
+
 	err := cdp.ApplyLedgerMetadata(
 		ledgerRange,
 		publisherConfig,
 		ctx,
 		func(lcm xdr.LedgerCloseMeta) error {
+
 			currentTime := time.Now()
 			ledgerProcessingTime := currentTime.Sub(lastLedgerTime)
 			lastLedgerTime = currentTime
@@ -241,14 +302,51 @@ func (adapter *BufferedStorageSourceAdapter) Start(ctx context.Context) error {
 // processLedger processes each ledger by passing it to registered processors.
 func (adapter *BufferedStorageSourceAdapter) processLedger(ctx context.Context, ledger xdr.LedgerCloseMeta) error {
 	sequence := ledger.LedgerSequence()
-	log.Printf("Processing ledger %d", sequence)
-	for _, proc := range adapter.processors {
-		if err := proc.Process(ctx, pluginapi.Message{Payload: ledger, Timestamp: time.Now()}); err != nil {
-			log.Printf("Error in processor %T for ledger %d: %v", proc, sequence, err)
-			return errors.Wrap(err, "error in processor")
-		}
-		log.Printf("Processor %T successfully processed ledger %d", proc, sequence)
+	log.Printf("Starting to process ledger %d", sequence)
+
+	// Check if we have any processors
+	if len(adapter.processors) == 0 {
+		log.Printf("Warning: No processors registered for ledger %d", sequence)
+		return nil
 	}
+
+	// Create message once for all processors
+	msg := pluginapi.Message{
+		Payload:   ledger,
+		Timestamp: time.Now(),
+	}
+
+	// Process through each processor in sequence
+	for i, proc := range adapter.processors {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			procStart := time.Now()
+
+			// Add processor-specific context
+			processorCtx := context.WithValue(ctx, "processor_index", i)
+			processorCtx = context.WithValue(processorCtx, "processor_type", fmt.Sprintf("%T", proc))
+
+			if err := proc.Process(processorCtx, msg); err != nil {
+				log.Printf("Error in processor %d (%T) for ledger %d: %v", i, proc, sequence, err)
+				// You might want to implement retry logic here
+				return errors.Wrapf(err, "processor %d (%T) failed", i, proc)
+			}
+
+			processingTime := time.Since(procStart)
+			if processingTime > time.Second {
+				log.Printf("Warning: Processor %d (%T) took %v to process ledger %d",
+					i, proc, processingTime, sequence)
+			} else {
+				log.Printf("Processor %d (%T) successfully processed ledger %d in %v",
+					i, proc, sequence, processingTime)
+			}
+		}
+	}
+
+	log.Printf("Successfully completed processing ledger %d through %d processors",
+		sequence, len(adapter.processors))
 	return nil
 }
 
