@@ -1,0 +1,5 @@
+# Mark vendored files as linguist-vendored to improve GitHub statistics
+vendor/** linguist-vendored
+
+# Nix files
+*.nix linguist-detectable=true 
