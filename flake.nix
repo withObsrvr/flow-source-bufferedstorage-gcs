@@ -18,7 +18,7 @@
             version = "0.1.0";
             src = ./.;
             
-            # Use null to skip vendoring check initially or if using vendored deps
+            # Use null to skip vendoring check since we're using a vendor directory
             vendorHash = null;
             
             # Disable hardening which is required for Go plugins
@@ -27,12 +27,13 @@
             # Configure build environment for plugin compilation 
             preBuild = ''
               export CGO_ENABLED=1
+              # Use Go 1.23.4 to match go.mod exactly
+              export GOFLAGS="-mod=vendor"
             '';
             
             # Build as a shared library/plugin
             buildPhase = ''
               runHook preBuild
-              # Use -mod=vendor if you have vendored dependencies
               go build -mod=vendor -buildmode=plugin -o flow-source-bufferedstorage-gcs.so .
               runHook postBuild
             '';
@@ -54,7 +55,7 @@
             # Add dependencies needed for the build
             nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs = [ 
-              # Add any required C library dependencies here
+              # Add any required C library dependencies here if needed
             ];
           };
         };
@@ -62,7 +63,7 @@
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [ 
             # Use Go 1.23 to match your project's go.mod
-            go_1_21
+            go_1_23
             pkg-config
             git  # Needed for vendoring dependencies
             gopls
@@ -73,6 +74,7 @@
           shellHook = ''
             # Enable CGO which is required for plugin mode
             export CGO_ENABLED=1
+            export GOFLAGS="-mod=vendor"
             
             # Helper to vendor dependencies - greatly improves build reliability
             if [ ! -d vendor ]; then
